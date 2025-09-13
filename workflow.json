@@ -1,0 +1,224 @@
+{
+  "name": "Flashcards Three‑AI Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "flashcards",
+        "options": {
+          "responseData": "allEntries",
+          "responseMode": "lastNode",
+          "responseCode": 200
+        }
+      },
+      "id": "Webhook_In",
+      "name": "Webhook In (POST /flashcards)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [ -300, 0 ],
+      "webhookMethods": { "POST": true }
+    },
+    {
+      "parameters": {
+        "functionCode": "const body = $json;\n// Accept either a fileUrl or rawText for quick tests\nconst fileUrl = body.fileUrl || '';\nconst rawText = body.rawText || '';\nconst depth = body.depth || 'detailed';\nconst targetCount = Number(body.targetCount || 80);\nconst bloomLevel = body.bloomLevel || 'understand/analyze';\nconst clozeRatio = Number(body.clozeRatio || 0.25);\nconst courseTag = body.courseTag || 'General';\nreturn [{ json: { fileUrl, rawText, depth, targetCount, bloomLevel, clozeRatio, courseTag }, pairedItem: { item: 0 } }];"
+      },
+      "id": "Init",
+      "name": "Init Defaults",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [ -60, 0 ]
+    },
+    {
+      "parameters": {
+        "url": "={{$json.fileUrl}}",
+        "responseFormat": "file",
+        "options": { "fullResponse": false }
+      },
+      "id": "Download",
+      "name": "Download File",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [ 160, -80 ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const url = $json.fileUrl || '';\nlet ext = '';\ntry { ext = new URL(url).pathname.split('.').pop().toLowerCase(); } catch (e) { ext = ''; }\nreturn [{ json: { ext }, pairedItem: { item: 0 } }];"
+      },
+      "id": "DetectExt",
+      "name": "Detect Extension",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [ 160, 80 ]
+    },
+    {
+      "parameters": {
+        "command": "python3",
+        "input": "binary",
+        "script": "# Extract text from uploaded document\nimport sys, json, os, subprocess\nfrom base64 import b64decode\n# n8n injects environment variables with execution context\next = json.loads(os.environ.get('N8N_EXEC_DATA', '{}')).get('ext','')\nraw = sys.stdin.buffer.read()\n# write binary to temp file\nwith open('/tmp/infile','wb') as f:\n    f.write(raw)\ntext = ''\ntry:\n    if ext == 'pdf':\n        import fitz\n        doc = fitz.open('/tmp/infile')\n        blocks = []\n        for page in doc:\n            blocks.append(page.get_text('text'))\n        text = '\n'.join(blocks)\n    elif ext == 'docx':\n        import docx\n        d = docx.Document('/tmp/infile')\n        text = '\n'.join(p.text for p in d.paragraphs)\n    elif ext == 'pptx':\n        from pptx import Presentation\n        prs = Presentation('/tmp/infile')\n        slides = []\n        for s in prs.slides:\n            items = []\n            for shape in s.shapes:\n                if hasattr(shape, 'text'):\n                    items.append(shape.text)\n            slides.append('\n'.join(items))\n        text = '\n\n'.join(slides)\n    else:\n        # fallback to poppler\n        try:\n            subprocess.run(['pdftotext','/tmp/infile','/tmp/out.txt'], check=False, capture_output=True)\n            if os.path.exists('/tmp/out.txt'):\n                with open('/tmp/out.txt','r') as f:\n                    text = f.read()\n        except Exception:\n            pass\n        # fallback to OCR if text still empty\n        if not text.strip():\n            subprocess.run(['pdftoppm','-png','/tmp/infile','/tmp/page'], check=False)\n            pages = [f for f in os.listdir('/tmp') if f.startswith('page') and f.endswith('.png')]\n            ocr_texts = []\n            for page_file in sorted(pages):\n                out_base = '/tmp/ocr_out'\n                subprocess.run(['tesseract','/tmp/'+page_file,out_base,'-l','eng','--psm','3'], check=False, capture_output=True)\n                txt_file = out_base + '.txt'\n                if os.path.exists(txt_file):\n                    with open(txt_file,'r') as fr:\n                        ocr_texts.append(fr.read())\n            text = '\n'.join(ocr_texts)\nexcept Exception as e:\n    pass\nif not text.strip():\n    text = '(No extractable text found)'\n# limit to 1M characters to avoid huge payloads\nout = {'text': text[:1000000]}\nprint(json.dumps(out))",
+        "options": {
+          "environmentVariables": "={{ { \"N8N_EXEC_DATA\": JSON.stringify($json) } }}"
+        }
+      },
+      "id": "Extract",
+      "name": "Extract Text (Python)",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 2,
+      "position": [ 420, 0 ]
+    },
+    {
+      "parameters": {
+        "functionCode": "function chunkText(str, maxLength = 8000) { const parts = []; let i = 0; while (i < str.length) { parts.push(str.slice(i, i + maxLength)); i += maxLength; } return parts; }\nconst text = ($json.text || '') + ($json.rawText || '');\nconst chunks = chunkText(text, 8000);\nreturn chunks.map((c, idx) => ({ json: { chunkIndex: idx, chunkText: c } }));"
+      },
+      "id": "Chunk",
+      "name": "Chunk Text",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [ 640, 0 ]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "systemMessage": "You are an expert educator. Produce high‑fidelity flashcards that fully cover the supplied chunk. Return a JSON array only. Each card must include: id, type ('basic'|'cloze'|'multi'), question, answer, explanation (1–3 sentences), bloom, topicPath, tags[], difficulty (1–5), sources[].",
+        "messages": [
+          {
+            "type": "user",
+            "message": "DEPTH: {{ $items(\"Init\")[0].json.depth }}\nTARGET_BLOOM: {{ $items(\"Init\")[0].json.bloomLevel }}\nCLOZE_RATIO: {{ $items(\"Init\")[0].json.clozeRatio }}\nCOURSE_TAG: {{ $items(\"Init\")[0].json.courseTag }}\n\nCHUNK_INDEX: {{ $json.chunkIndex }}\nCHUNK_TEXT:\n\"\"\"\n{{ $json.chunkText }}\n\"\"\"\n\nReturn JSON array only."
+          }
+        ],
+        "options": {
+          "responseFormat": "json"
+        }
+      },
+      "id": "AI_Generate",
+      "name": "AI #1 Generate Cards",
+      "type": "n8n-nodes-base.openAi.chat",
+      "typeVersion": 3,
+      "position": [ 860, 0 ],
+      "credentials": {
+        "openAIApi": {
+          "id": "OpenAI API",
+          "name": "openAIApi"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fieldToCombine": "json",
+        "combineBy": "aggregate",
+        "options": {}
+      },
+      "id": "MergeCards",
+      "name": "Merge Generated",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 2,
+      "position": [ 1080, 0 ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const arrays = $items().map(i => i.json);\nlet cards = [];\nfor (const arr of arrays) { if (Array.isArray(arr)) cards.push(...arr); else if (Array.isArray(arr.cards)) cards.push(...arr.cards); }\nconst seen = new Set();\ncards = cards.filter(c => { const key = (c.question || '').trim().toLowerCase(); if (seen.has(key)) return false; seen.add(key); return true; });\nreturn [{ json: { cards } }];"
+      },
+      "id": "Dedupe",
+      "name": "Dedupe & Pack",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [ 1280, 0 ]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "systemMessage": "You are a coverage auditor. Input is a JSON array of flashcards and the source text. Identify missing topics, duplicates, vague or weak cards. Return JSON with keys: missingTopics (list of {hint, priority}), weakCards (list of {id, issue, fixHint}), actions (e.g. 'add','replace','tighten').",
+        "messages": [
+          {
+            "type": "user",
+            "message": "SOURCE_TEXT (first 30k chars):\n\"\"\"\n{{ $items(\"Extract\")[0].json.text.slice(0,30000) }}\n\"\"\"\n\nCARDS:\n{{ JSON.stringify($json.cards) }}\n\nReturn JSON object only."
+          }
+        ],
+        "options": {
+          "responseFormat": "json"
+        }
+      },
+      "id": "AI_Audit",
+      "name": "AI #2 Audit Coverage",
+      "type": "n8n-nodes-base.openAi.chat",
+      "typeVersion": 3,
+      "position": [ 1500, 0 ],
+      "credentials": {
+        "openAIApi": {
+          "id": "OpenAI API",
+          "name": "openAIApi"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "const cards = $items(\"Dedupe\")[0].json.cards;\nconst audit = $json;\nreturn [{ json: { cards, audit } }];"
+      },
+      "id": "PackForFiller",
+      "name": "Pack for Filler",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [ 1700, 0 ]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "systemMessage": "You generate ONLY additional or replacement flashcards to fix coverage gaps. Follow the same JSON schema as before (array of cards). Do not repeat existing content.",
+        "messages": [
+          {
+            "type": "user",
+            "message": "SOURCE_TEXT (first 30k chars):\n\"\"\"\n{{ $items(\"Extract\")[0].json.text.slice(0,30000) }}\n\"\"\"\n\nEXISTING_CARDS:\n{{ JSON.stringify($json.cards) }}\n\nAUDIT:\n{{ JSON.stringify($json.audit) }}\n\nReturn ONLY a JSON array of new or replacement cards."
+          }
+        ],
+        "options": {
+          "responseFormat": "json"
+        }
+      },
+      "id": "AI_Fill",
+      "name": "AI #3 Fill Gaps",
+      "type": "n8n-nodes-base.openAi.chat",
+      "typeVersion": 3,
+      "position": [ 1920, 0 ],
+      "credentials": {
+        "openAIApi": {
+          "id": "OpenAI API",
+          "name": "openAIApi"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "const baseCards = $items(\"Dedupe\")[0].json.cards;\nconst newCards = Array.isArray($json) ? $json : [];\nconst seen = new Set(baseCards.map(c => (c.question || '').trim().toLowerCase()));\nfor (const c of newCards) { const key = (c.question || '').trim().toLowerCase(); if (!seen.has(key)) { baseCards.push(c); seen.add(key); } }\nreturn [{ json: { cards: baseCards, audit: $items(\"AI_Audit\")[0].json } }];"
+      },
+      "id": "MergeFilled",
+      "name": "Merge Filled",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [ 2140, 0 ]
+    },
+    {
+      "parameters": {
+        "responseBody": "={{ { status: 'ok', total: $json.cards.length, audit: $json.audit, cards: $json.cards } }}",
+        "responseCode": 200
+      },
+      "id": "Respond",
+      "name": "Respond JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [ 2360, 0 ]
+    }
+  ],
+  "connections": {
+    "Webhook In (POST /flashcards)": { "main": [ [ { "node": "Init Defaults", "type": "main", "index": 0 } ] ] },
+    "Init Defaults": { "main": [ [ { "node": "Download File", "type": "main", "index": 0 }, { "node": "Detect Extension", "type": "main", "index": 0 } ] ] },
+    "Detect Extension": { "main": [ [ { "node": "Extract Text (Python)", "type": "main", "index": 0 } ] ] },
+    "Download File": { "main": [ [ { "node": "Extract Text (Python)", "type": "main", "index": 0 } ] ] },
+    "Extract Text (Python)": { "main": [ [ { "node": "Chunk Text", "type": "main", "index": 0 } ] ] },
+    "Chunk Text": { "main": [ [ { "node": "AI #1 Generate Cards", "type": "main", "index": 0 } ] ] },
+    "AI #1 Generate Cards": { "main": [ [ { "node": "Merge Generated", "type": "main", "index": 0 } ] ] },
+    "Merge Generated": { "main": [ [ { "node": "Dedupe & Pack", "type": "main", "index": 0 } ] ] },
+    "Dedupe & Pack": { "main": [ [ { "node": "AI #2 Audit Coverage", "type": "main", "index": 0 } ] ] },
+    "AI #2 Audit Coverage": { "main": [ [ { "node": "Pack for Filler", "type": "main", "index": 0 } ] ] },
+    "Pack for Filler": { "main": [ [ { "node": "AI #3 Fill Gaps", "type": "main", "index": 0 } ] ] },
+    "AI #3 Fill Gaps": { "main": [ [ { "node": "Merge Filled", "type": "main", "index": 0 } ] ] },
+    "Merge Filled": { "main": [ [ { "node": "Respond JSON", "type": "main", "index": 0 } ] ] }
+  }
+}
