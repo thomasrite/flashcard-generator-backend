@@ -9,7 +9,7 @@ RUN if command -v apt-get >/dev/null 2>&1 ; then \
     elif command -v apk >/dev/null 2>&1 ; then \
       apk update && apk add --no-cache python3 py3-pip ; \
     fi \
-    && pip3 install --no-cache-dir pymupdf python-docx python-pptx
+    && pip3 install --no-cache-dir pymupdf python-docx python-pptx --break-system-packages
 
 # Return to the default user for running n8n
 USER node
