@@ -13,3 +13,5 @@ RUN if command -v apt-get >/dev/null 2>&1 ; then \
 
 # Return to the default user for running n8n
 USER node
+
+
